@@ -345,6 +345,33 @@ local myId = -1
 local function say(msg) sampAddChatMessage(u8:decode(msg), -1) end
 local function sendChat(msg) sampSendChat(u8:decode(msg)) end
 
+local function sendPacked(items, prefixFirst, prefixRest)
+    if not items or #items == 0 then return end
+    prefixFirst = prefixFirst or ""
+    prefixRest = prefixRest or prefixFirst
+    local idx = 1
+    local isFirstMsg = true
+    while idx <= #items do
+        local prefix = isFirstMsg and prefixFirst or prefixRest
+        if #prefix + #items[idx] > CHAT_MAX_LEN and #prefix > #prefixRest then
+            prefix = prefixRest
+        end
+        local current = prefix .. items[idx]
+        local j = idx + 1
+        while j <= #items do
+            local candidate = current .. ", " .. items[j]
+            if #candidate > CHAT_MAX_LEN then break end
+            current = candidate
+            j = j + 1
+        end
+        if current:sub(-1) ~= "." then current = current .. "." end
+        sendChat(current)
+        wait(3000)
+        idx = j
+        isFirstMsg = false
+    end
+end
+
 local function formatNick(nick)
     if not nick then return "" end
     return (nick:gsub("_", " "))
@@ -990,54 +1017,137 @@ local function sendAdvertisement()
 end
 
 -- ============================================================
--- MODERN UI LAYER
+-- MODERN UI LAYER  ·  визуальный слой (редизайн)
+-- Логика, ID виджетов и обработчики сохранены без изменений.
 -- ============================================================
 
 local THEME = {
-    width = 340.0,
-    radius = 12.0,
-    padding = 12.0,
+    width = 356.0,
+    radius = 14.0,
+    padding = 14.0,
     gap = 8.0,
     colors = {
-        bg       = {0.070, 0.078, 0.098, 0.970},
-        surface  = {0.110, 0.120, 0.150, 0.920},
-        surface2 = {0.145, 0.155, 0.190, 0.950},
-        border   = {0.220, 0.240, 0.300, 0.750},
-        shadow   = {0.000, 0.000, 0.000, 0.350},
-        text     = {0.950, 0.960, 0.980, 1.000},
-        muted    = {0.580, 0.620, 0.700, 1.000},
-        accent   = {0.270, 0.620, 1.000, 1.000},
-        success  = {0.250, 0.850, 0.450, 1.000},
-        warning  = {1.000, 0.700, 0.200, 1.000},
-        danger   = {1.000, 0.300, 0.350, 1.000},
-        purple   = {0.620, 0.350, 0.950, 1.000},
+        bgTop    = {0.058, 0.066, 0.090, 0.970},
+        bgBot    = {0.086, 0.098, 0.132, 0.970},
+        surface  = {0.106, 0.118, 0.153, 0.920},
+        surface2 = {0.150, 0.165, 0.208, 0.950},
+        border   = {0.320, 0.360, 0.460, 0.420},
+        inner    = {1.000, 1.000, 1.000, 0.045},
+        shadow   = {0.000, 0.000, 0.000, 0.320},
+        text     = {0.945, 0.958, 0.985, 1.000},
+        muted    = {0.565, 0.615, 0.710, 1.000},
+        faint    = {0.420, 0.465, 0.560, 1.000},
+        accent   = {0.290, 0.620, 1.000, 1.000},
+        accent2  = {0.560, 0.380, 0.990, 1.000},
+        success  = {0.220, 0.840, 0.490, 1.000},
+        warning  = {1.000, 0.720, 0.240, 1.000},
+        danger   = {0.990, 0.330, 0.380, 1.000},
+        purple   = {0.650, 0.400, 0.980, 1.000},
+        gold     = {1.000, 0.780, 0.290, 1.000},
+        silver   = {0.770, 0.820, 0.900, 1.000},
+        bronze   = {0.880, 0.570, 0.340, 1.000},
     }
 }
 
 local C = THEME.colors
-local anim_alpha = 0.0
+
+-- ------------------------------------------------------------
+-- СОСТОЯНИЕ АНИМАЦИЙ (лёгкие: lerp + синус, без тяжёлых эффектов)
+-- ------------------------------------------------------------
+local anim_alpha = 0.0          -- плавное появление/исчезновение окна
+local gender_anim = 0.0         -- плавное появление модального окна пола
+local ui_time = 0.0             -- общее время UI (для синус-эффектов)
+local frame_dt = 0.016          -- дельта последнего кадра
 local last_time = os.clock()
+local ctx_alpha = 1.0           -- альфа текущего рисуемого окна
+local widgetAnim = {}           -- сглаженные состояния hover/press виджетов
+local genderSnap = nil          -- снимок данных для fade-out модального окна
+local faKey, faGlowT = nil, -10.0 -- однократная вспышка карточки ответа
+
+local CF = imgui.DrawCornerFlags
+local HAS_HOVERRECT = (imgui.IsMouseHoveringRect ~= nil)
 
 local function V2(x, y) return imgui.ImVec2(x, y) end
 local function V4(r, g, b, a) return imgui.ImVec4(r, g, b, a) end
 
+local function clamp01(v)
+    if v ~= v then return 0.0 end
+    if v < 0.0 then return 0.0 end
+    if v > 1.0 then return 1.0 end
+    return v
+end
+
 local function Col(color, alphaMultiplier)
-    local a = (alphaMultiplier or 1.0) * (color[4] or 1.0) * (anim_alpha or 1.0)
-    if a > 1.0 then a = 1.0 end
-    if a < 0.0 then a = 0.0 end
-    return imgui.ColorConvertFloat4ToU32(V4(color[1], color[2], color[3], a))
+    local a = (alphaMultiplier or 1.0) * (color[4] or 1.0) * (ctx_alpha or 1.0)
+    return imgui.ColorConvertFloat4ToU32(V4(color[1], color[2], color[3], clamp01(a)))
+end
+
+local function WithA(c, a) return { c[1], c[2], c[3], a } end
+
+local function MixCol(c1, c2, t)
+    t = clamp01(t)
+    local a1, a2 = c1[4] or 1.0, c2[4] or 1.0
+    return {
+        c1[1] + (c2[1] - c1[1]) * t,
+        c1[2] + (c2[2] - c1[2]) * t,
+        c1[3] + (c2[3] - c1[3]) * t,
+        a1 + (a2 - a1) * t,
+    }
+end
+
+local function SmoothTo(cur, target, rate)
+    local k = rate * frame_dt
+    if k > 1.0 then k = 1.0 elseif k < 0.0 then k = 0.0 end
+    return cur + (target - cur) * k
+end
+
+local function GetAnim(id)
+    local s = widgetAnim[id]
+    if not s then s = { h = 0.0, a = 0.0 } widgetAnim[id] = s end
+    return s
+end
+
+-- ------------------------------------------------------------
+-- ШРИФТЫ (загружаются один раз при инициализации)
+-- ------------------------------------------------------------
+local FONTS = {}
+
+local function PushF(name)
+    local f = FONTS[name]
+    if f ~= nil and imgui.PushFont ~= nil then
+        if pcall(imgui.PushFont, f) then return true end
+    end
+    return false
+end
+
+local function PopF(pushed)
+    if pushed and imgui.PopFont ~= nil then pcall(imgui.PopFont) end
+end
+
+local function TextSize(text, fname)
+    local p = PushF(fname)
+    local s = imgui.CalcTextSize(text or "")
+    PopF(p)
+    return s
+end
+
+local function DText(dl, pos, u32col, text, fname, shadow)
+    local p = PushF(fname)
+    if shadow then dl:AddText(pos + V2(0, 1), Col({0.0, 0.0, 0.0, shadow}), text) end
+    dl:AddText(pos, u32col, text)
+    PopF(p)
 end
 
 local settingBuffers = {}
 
 local BUTTON_KINDS = {
-    primary = { bg = C.accent, hover = {0.360, 0.700, 1.000, 1.000}, active = {0.180, 0.520, 0.900, 1.000}, border = false },
-    success = { bg = C.success, hover = {0.350, 0.930, 0.550, 1.000}, active = {0.180, 0.720, 0.360, 1.000}, border = false },
-    danger  = { bg = C.danger, hover = {1.000, 0.400, 0.450, 1.000}, active = {0.800, 0.200, 0.250, 1.000}, border = false },
-    warning = { bg = C.warning, hover = {1.000, 0.800, 0.350, 1.000}, active = {0.850, 0.600, 0.120, 1.000}, border = false },
-    purple  = { bg = C.purple, hover = {0.720, 0.450, 1.000, 1.000}, active = {0.520, 0.270, 0.850, 1.000}, border = false },
-    neutral = { bg = C.surface2, hover = {0.200, 0.215, 0.260, 1.000}, active = {0.130, 0.140, 0.175, 1.000}, border = true },
-    ghost   = { bg = {0.120, 0.130, 0.160, 0.750}, hover = {0.170, 0.185, 0.225, 0.950}, active = {0.100, 0.110, 0.140, 1.000}, border = true },
+    primary = { bg = C.accent,   hover = {0.400, 0.700, 1.000, 1.000}, active = {0.190, 0.520, 0.900, 1.000}, border = false },
+    success = { bg = C.success,  hover = {0.340, 0.920, 0.580, 1.000}, active = {0.160, 0.700, 0.380, 1.000}, border = false },
+    danger  = { bg = C.danger,   hover = {1.000, 0.420, 0.470, 1.000}, active = {0.800, 0.220, 0.270, 1.000}, border = false },
+    warning = { bg = C.warning,  hover = {1.000, 0.800, 0.380, 1.000}, active = {0.860, 0.600, 0.140, 1.000}, border = false },
+    purple  = { bg = C.purple,   hover = {0.740, 0.500, 1.000, 1.000}, active = {0.530, 0.290, 0.860, 1.000}, border = false },
+    neutral = { bg = C.surface2, hover = {0.205, 0.222, 0.275, 1.000}, active = {0.130, 0.142, 0.180, 1.000}, border = true },
+    ghost   = { bg = {0.130, 0.143, 0.180, 0.600}, hover = {0.180, 0.196, 0.240, 0.900}, active = {0.110, 0.120, 0.150, 0.950}, border = true, flat = true },
 }
 
 local function ModernButton(id, label, width, height, kind, onClick)
@@ -1048,25 +1158,41 @@ local function ModernButton(id, label, width, height, kind, onClick)
     local hovered = imgui.IsItemHovered()
     local active = imgui.IsItemActive()
 
+    -- плавные hover/press переходы (экспоненциальное сглаживание)
+    local s = GetAnim(id)
+    s.h = SmoothTo(s.h, hovered and 1.0 or 0.0, 13.0)
+    s.a = SmoothTo(s.a, active and 1.0 or 0.0, 22.0)
+    if s.h < 0.003 then s.h = 0.0 end
+    if s.a < 0.003 then s.a = 0.0 end
+
     local k = BUTTON_KINDS[kind] or BUTTON_KINDS.neutral
-    local base = k.bg
-    if active then base = k.active elseif hovered then base = k.hover end
+    local base = MixCol(k.bg, k.hover, s.h)
+    base = MixCol(base, k.active, s.a)
 
-    if kind ~= "ghost" then
-        local shadowOffset = hovered and 3.0 or 2.0
-        dl:AddRectFilled(pos + V2(0, shadowOffset), pos + size + V2(0, shadowOffset), Col(C.shadow, 0.75), THEME.radius)
+    local sink = s.a * 1.5
+    local p = pos + V2(0, sink)
+    local r = THEME.radius - 3
+
+    -- мягкое свечение при наведении
+    if not k.flat and s.h > 0.02 then
+        local g = 2.0 + 2.0 * s.h
+        dl:AddRectFilled(pos + V2(-g, -g), pos + size + V2(g, g), Col(WithA(k.bg, 0.13 * s.h)), r + 4)
     end
-
-    dl:AddRectFilled(pos, pos + size, Col(base), THEME.radius)
-
+    -- тень
+    if not k.flat then
+        dl:AddRectFilled(pos + V2(1, 3), pos + size + V2(-1, 5), Col(WithA(C.shadow, 0.45 + 0.25 * s.h)), r)
+    end
+    -- корпус
+    dl:AddRectFilled(p, p + size, Col(base), r)
     if k.border then
-        dl:AddRect(pos, pos + size, Col(hovered and C.accent or C.border), THEME.radius, 0, 1.2)
+        -- Убрали динамическую толщину, оставили четкую линию в 1 пиксель
+        dl:AddRect(p, p + size, Col(MixCol(C.border, C.accent, s.h * 0.75)), r, 0, 1.0)
     end
+    -- верхний блик (объём)
+    dl:AddRectFilled(p + V2(r, 1.2), p + V2(width - r, 2.2), Col(WithA({1.0, 1.0, 1.0, 1.0}, 0.06 + 0.10 * s.h)), 0.0)
 
-    dl:AddLine(pos + V2(10, 1.5), pos + V2(width - 10, 1.5), Col({1, 1, 1, hovered and 0.12 or 0.05}), 1.0)
-
-    local ts = imgui.CalcTextSize(label)
-    dl:AddText(pos + V2((width - ts.x) * 0.5, (height - ts.y) * 0.5 - 1), Col(C.text), label)
+    local ts = TextSize(label, "semi")
+    DText(dl, p + V2((width - ts.x) * 0.5, (height - ts.y) * 0.5 - 1.0), Col(C.text), label, "semi")
 
     if clicked and onClick then onClick() end
 end
@@ -1075,18 +1201,29 @@ local function SectionTitle(text)
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
     local w = imgui.GetContentRegionAvail().x
-    dl:AddText(pos, Col(C.muted), text)
-    dl:AddLine(pos + V2(0, 16), pos + V2(w, 16), Col(C.border), 1.0)
-    imgui.Dummy(V2(w, 24))
+    local ts = TextSize(text, "small")
+    -- акцентная метка + заголовок + затухающая линия
+    dl:AddRectFilled(pos + V2(0, 2), pos + V2(3, 13), Col(C.accent), 1.5)
+    DText(dl, pos + V2(9, 0), Col(C.muted), text, "small")
+    local lx = pos.x + 9 + ts.x + 12
+    local ly = pos.y + 7.5
+    if lx < pos.x + w - 8 then
+        local mid = lx + (pos.x + w - lx) * 0.45
+        dl:AddRectFilled(V2(lx, ly), V2(mid, ly + 1), Col(WithA(C.border, 0.90)), 0)
+        dl:AddRectFilled(V2(mid, ly), V2(pos.x + w, ly + 1), Col(WithA(C.border, 0.35)), 0)
+    end
+    imgui.Dummy(V2(w, 22))
 end
 
 local function StatTile(label, value, color, width, height)
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
-    dl:AddRectFilled(pos, pos + V2(width, height), Col(C.surface), THEME.radius - 2)
-    dl:AddRectFilled(pos, pos + V2(3, height), Col(color), 2.0)
-    dl:AddText(pos + V2(12, 8), Col(C.muted), label)
-    dl:AddText(pos + V2(12, 28), Col(color), value)
+    local r = THEME.radius - 3
+    dl:AddRectFilled(pos, pos + V2(width, height), Col(C.surface), r)
+    dl:AddRect(pos, pos + V2(width, height), Col(C.inner), r, 0, 1.0)
+    dl:AddRectFilled(pos + V2(0, 12), pos + V2(3.5, height - 12), Col(color), 1.75)
+    DText(dl, pos + V2(14, 9), Col(C.muted), label, "small")
+    DText(dl, pos + V2(14, 28), Col(color), value, "big", 0.30)
     imgui.Dummy(V2(width, height))
 end
 
@@ -1094,7 +1231,8 @@ local function DrawQuestionCard()
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
     local w = imgui.GetContentRegionAvail().x
-    
+    local r = THEME.radius - 2
+
     local title, main, sub, color = "ВОПРОС", "", "", C.accent
 
     if currentMode == "math" then
@@ -1113,12 +1251,40 @@ local function DrawQuestionCard()
         color = C.purple
     end
 
-    local h = (sub ~= "") and 84.0 or 64.0
-    dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), THEME.radius)
-    dl:AddRectFilled(pos, pos + V2(w, 3), Col(color), THEME.radius)
-    dl:AddText(pos + V2(12, 12), Col(C.muted), title)
-    dl:AddText(pos + V2(12, 34), Col(color), main)
-    if sub ~= "" then dl:AddText(pos + V2(12, 58), Col(C.success), sub) end
+    local mainColor = color
+    if main == "" then main = "-"; mainColor = C.faint end
+
+    local h = (sub ~= "") and 90.0 or 68.0
+    dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), r)
+    dl:AddRect(pos, pos + V2(w, h), Col(WithA(color, 0.30)), r, 0, 1.0)
+
+    -- акцентная полоса сверху + медленный бегущий блик
+    local x0, x1 = pos.x + r, pos.x + w - r
+    dl:AddRectFilled(V2(x0, pos.y), V2(x1, pos.y + 3), Col(WithA(color, 0.85)), 0)
+    local span = x1 - x0
+    local sweepW = 70.0
+    local ph = (ui_time * 0.30) % 2.0
+    if ph < 1.0 and span > sweepW then
+        local cx0 = x0 + ph * (span + sweepW) - sweepW * 0.5
+        local segA = { 0.10, 0.30, 0.30, 0.10 }
+        for seg = 1, 4 do
+            local sx0 = cx0 + (seg - 1) * (sweepW * 0.25)
+            local sx1 = sx0 + sweepW * 0.25
+            if sx0 < x0 then sx0 = x0 end
+            if sx1 > x1 then sx1 = x1 end
+            if sx1 > sx0 then
+                dl:AddRectFilled(V2(sx0, pos.y), V2(sx1, pos.y + 3), Col(WithA({1.0, 1.0, 1.0, 1.0}, segA[seg])), 0)
+            end
+        end
+    end
+
+    -- маркер + тексты
+    dl:AddCircleFilled(pos + V2(15.5, 18.5), 2.6, Col(color), 12)
+    DText(dl, pos + V2(24, 12), Col(C.muted), title, "small")
+    DText(dl, pos + V2(14, 31), Col(mainColor), main, "big", 0.35)
+    if sub ~= "" then
+        DText(dl, pos + V2(14, 61), Col(C.success), sub, "semi")
+    end
     imgui.Dummy(V2(w, h + THEME.gap))
 end
 
@@ -1126,19 +1292,40 @@ local function DrawFirstAnswerCard()
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
     local w = imgui.GetContentRegionAvail().x
-    local h = 64.0
+    local h = 66.0
+    local r = THEME.radius - 2
 
     if currentFirstAnswer then
-        local bg = {C.success[1], C.success[2], C.success[3], 0.12}
-        dl:AddRectFilled(pos, pos + V2(w, h), Col(bg), THEME.radius)
-        dl:AddRect(pos, pos + V2(w, h), Col(C.success), THEME.radius, 0, 1.0)
-        dl:AddText(pos + V2(12, 10), Col(C.muted), "ПЕРВЫЙ ОТВЕТ")
-        local line = formatNick(currentFirstAnswer.nick or "???") .. " — " .. tostring(currentFirstAnswer.answer or "")
-        dl:AddText(pos + V2(12, 34), Col(C.text), line)
+        -- однократная мягкая вспышка при появлении ответа
+        local key = tostring(currentFirstAnswer.nick) .. "@" .. tostring(currentFirstAnswer.time)
+        if key ~= faKey then faKey = key faGlowT = ui_time end
+        local gt = ui_time - faGlowT
+        local pulse = 0.0
+        if gt >= 0.0 and gt < 1.5 then
+            pulse = 1.0 - (gt / 1.5)
+            pulse = pulse * pulse
+        end
+
+        if pulse > 0.01 then
+            dl:AddRectFilled(pos + V2(-3, -3), pos + V2(w + 3, h + 3), Col(WithA(C.success, 0.22 * pulse)), r + 3)
+        end
+        dl:AddRectFilled(pos, pos + V2(w, h), Col(WithA(C.success, 0.10 + 0.05 * pulse)), r)
+        dl:AddRect(pos, pos + V2(w, h), Col(WithA(C.success, 0.45 + 0.25 * pulse)), r, 0, 1.0)
+        dl:AddRectFilled(pos + V2(r, 0), pos + V2(w - r, 2.5), Col(WithA(C.success, 0.75)), 0)
+
+        DText(dl, pos + V2(14, 10), Col(C.muted), "ПЕРВЫЙ ОТВЕТ", "small")
+        local line1 = formatNick(currentFirstAnswer.nick or "???") .. " - "
+        local tw = TextSize(line1, "semi")
+        DText(dl, pos + V2(14, 33), Col(C.text), line1, "semi")
+        DText(dl, pos + V2(14 + tw.x, 33), Col(C.success), tostring(currentFirstAnswer.answer or ""), "semi")
     else
-        dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), THEME.radius)
-        dl:AddText(pos + V2(12, 10), Col(C.muted), "ПЕРВЫЙ ОТВЕТ")
-        dl:AddText(pos + V2(12, 34), Col(C.muted), "Ожидание ответа...")
+        dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), r)
+        dl:AddRect(pos, pos + V2(w, h), Col(C.inner), r, 0, 1.0)
+        DText(dl, pos + V2(14, 10), Col(C.muted), "ПЕРВЫЙ ОТВЕТ", "small")
+        -- "дыхание" текста ожидания + анимированное многоточие
+        local dots = string.rep(".", 1 + math.floor(ui_time * 2.0) % 3)
+        local breathe = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(ui_time * 3.0))
+        DText(dl, pos + V2(14, 33), Col(C.faint, breathe), "Ожидание ответа" .. dots, "body")
     end
     imgui.Dummy(V2(w, h))
 end
@@ -1147,45 +1334,70 @@ local function DrawHeader(onClose)
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
     local w = imgui.GetContentRegionAvail().x
-    local h = 68.0
-    local title = "SFN Helper"
-    local subtitle = efirRunning and ("Эфир: " .. tostring(currentType or "")) or "Панель управления"
+    local h = 64.0
 
-    dl:AddText(pos, Col(C.text), title)
-    dl:AddText(pos + V2(0, 20), Col(C.muted), subtitle)
+    -- логотип: градиентная плитка с символом эфира
+    local ls = 36.0
+    local lp = pos + V2(0, 3)
+    dl:AddRectFilled(lp + V2(1, 3), lp + V2(ls + 1, ls + 4), Col(WithA(C.shadow, 0.40)), 11)
+    dl:AddRectFilled(lp, lp + V2(ls, ls), Col(C.accent), 11)
+    dl:AddRectFilled(lp + V2(0, ls * 0.55), lp + V2(ls, ls), Col(WithA(C.accent2, 0.40)), 11)
+    dl:AddRectFilled(lp + V2(5, 1.3), lp + V2(ls - 5, 2.3), Col(WithA({1.0, 1.0, 1.0, 1.0}, 0.25)), 0)
+    local lcx, lcy = lp.x + ls * 0.5 + 1.5, lp.y + ls * 0.5
+    dl:AddTriangleFilled(V2(lcx - 5, lcy - 7), V2(lcx - 5, lcy + 7), V2(lcx + 7, lcy), Col(WithA({1.0, 1.0, 1.0, 1.0}, 0.95)))
 
+    -- заголовок и подзаголовок
+    local tx = pos.x + ls + 12
+    DText(dl, V2(tx, pos.y + 1), Col(C.text), "SFN Helper", "title", 0.35)
+    local sub = efirRunning and ("Эфир · " .. tostring(currentType or "")) or "Панель управления"
+    sub = sub .. " · v" .. tostring(CURRENT_VERSION or "")
+    DText(dl, V2(tx + 1, pos.y + 30), Col(C.muted), sub, "small")
+
+    -- статус-пилюля LIVE/IDLE
     local statusText = efirRunning and "LIVE" or "IDLE"
     local statusColor = efirRunning and C.success or C.muted
-    local pulse = efirRunning and ((math.sin(os.clock() * 4.0) + 1.0) * 0.5) or 0.0
-    local dotAlpha = 0.45 + 0.55 * pulse
-    local dotColor = {statusColor[1], statusColor[2], statusColor[3], dotAlpha}
+    local sts = TextSize(statusText, "semi")
+    local pillW, pillH, closeW = sts.x + 30.0, 25.0, 27.0
+    local pillX = pos.x + w - pillW - closeW - 9.0
+    local pillY = pos.y + 6.0
+    dl:AddRectFilled(V2(pillX, pillY), V2(pillX + pillW, pillY + pillH), Col(WithA(C.surface2, 0.85)), pillH * 0.5)
+    dl:AddRect(V2(pillX, pillY), V2(pillX + pillW, pillY + pillH), Col(WithA(statusColor, 0.30)), pillH * 0.5, 0, 1.0)
+    local dcx, dcy = pillX + 14.0, pillY + pillH * 0.5
+    if efirRunning then
+        -- расходящееся кольцо пульса
+        local ringT = (ui_time % 1.9) / 1.9
+        dl:AddCircle(V2(dcx, dcy), 4.5 + ringT * 6.0, Col(WithA(statusColor, 0.40 * (1.0 - ringT))), 20, 1.2)
+    end
+    local pulse = efirRunning and (0.5 + 0.5 * math.sin(ui_time * 4.2)) or 0.0
+    dl:AddCircleFilled(V2(dcx, dcy), 4.0, Col(WithA(statusColor, 0.55 + 0.45 * pulse)), 18)
+    DText(dl, V2(pillX + 24.0, pillY + (pillH - sts.y) * 0.5 - 1.0), Col(statusColor), statusText, "semi")
 
-    local st = imgui.CalcTextSize(statusText)
-    local pillW, pillH, closeW = st.x + 28.0, 24.0, 26.0
-    local pillX, pillY = pos.x + w - pillW - closeW - 10.0, pos.y + 8.0
-
-    dl:AddRectFilled(V2(pillX, pillY), V2(pillX + pillW, pillY + pillH), Col(C.surface2, 0.95), pillH * 0.5)
-    dl:AddCircleFilled(V2(pillX + 13, pillY + pillH * 0.5), 4.0, Col(dotColor), 18)
-    dl:AddText(V2(pillX + 22, pillY + 5), Col(statusColor), statusText)
-
-    local cx, cy = pos.x + w - closeW, pos.y + 7.0
-    imgui.SetCursorScreenPos(V2(cx, cy))
+    -- кнопка закрытия (плавный hover, крестик линиями)
+    local cs = GetAnim("hdr_close")
+    local cx0, cy0 = pos.x + w - closeW, pos.y + 5.0
+    imgui.SetCursorScreenPos(V2(cx0, cy0))
     local closeClicked = imgui.InvisibleButton("header_close", V2(closeW, closeW))
     local closeHovered = imgui.IsItemHovered()
     local closeActive = imgui.IsItemActive()
-
-    local closeBg = C.surface2
-    if closeActive then closeBg = C.danger 
-    elseif closeHovered then closeBg = {C.danger[1], C.danger[2], C.danger[3], 0.55} end
-
-    dl:AddRectFilled(V2(cx, cy), V2(cx + closeW, cy + closeW), Col(closeBg), 8.0)
-    local xs = imgui.CalcTextSize("X")
-    dl:AddText(V2(cx + (closeW - xs.x) * 0.5, cy + (closeW - xs.y) * 0.5 - 1), Col(C.text), "X")
-
+    cs.h = SmoothTo(cs.h, closeHovered and 1.0 or 0.0, 15.0)
+    cs.a = SmoothTo(cs.a, closeActive and 1.0 or 0.0, 22.0)
+    local cbg = MixCol(C.surface2, C.danger, clamp01(cs.h * 0.85 + cs.a))
+    dl:AddRectFilled(V2(cx0, cy0), V2(cx0 + closeW, cy0 + closeW), Col(cbg), 9)
+    if cs.h > 0.02 then
+        dl:AddRect(V2(cx0, cy0), V2(cx0 + closeW, cy0 + closeW), Col(WithA(C.danger, 0.45 * cs.h)), 9, 0, 1.2)
+    end
+    local kk = 4.4
+    local ccx, ccy = cx0 + closeW * 0.5, cy0 + closeW * 0.5
+    local xcol = MixCol(C.muted, {1.0, 1.0, 1.0, 1.0}, clamp01(cs.h + cs.a))
+    dl:AddLine(V2(ccx - kk, ccy - kk), V2(ccx + kk, ccy + kk), Col(xcol), 1.7)
+    dl:AddLine(V2(ccx - kk, ccy + kk), V2(ccx + kk, ccy - kk), Col(xcol), 1.7)
     if closeClicked and onClose then onClose() end
 
+    -- разделитель с акцентным сегментом
     imgui.SetCursorScreenPos(pos)
-    dl:AddLine(pos + V2(0, h - 10), pos + V2(w, h - 10), Col(C.border), 1.0)
+    local sy = pos.y + h - 8
+    dl:AddRectFilled(V2(pos.x + 2, sy), V2(pos.x + w - 2, sy + 1), Col(WithA(C.border, 0.55)), 0)
+    dl:AddRectFilled(V2(pos.x + 2, sy), V2(pos.x + 78, sy + 1.6), Col(WithA(C.accent, 0.85)), 0)
     imgui.Dummy(V2(w, h))
 end
 
@@ -1193,28 +1405,35 @@ local function SettingRow(id, label, value, minVal, maxVal, onSave)
     local dl = imgui.GetWindowDrawList()
     local pos = imgui.GetCursorScreenPos()
     local w = imgui.GetContentRegionAvail().x
-    local h = 38.0
+    local h = 40.0
+    local r = THEME.radius - 4
 
-    dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), THEME.radius - 2)
-    dl:AddText(pos + V2(12, 11), Col(C.muted), label)
+    dl:AddRectFilled(pos, pos + V2(w, h), Col(C.surface), r)
+    dl:AddRect(pos, pos + V2(w, h), Col(C.inner), r, 0, 1.0)
+
+    local lsts = TextSize(label, "body")
+    DText(dl, pos + V2(12, (h - lsts.y) * 0.5 - 1), Col(C.muted), label, "body")
 
     local vs = tostring(value or 0)
-    local vts = imgui.CalcTextSize(vs)
-    dl:AddText(pos + V2(w - vts.x - 40, 11), Col(C.text), vs)
+    local vts = TextSize(vs, "semi")
+    DText(dl, pos + V2(w - vts.x - 44, (h - vts.y) * 0.5 - 1), Col(C.text), vs, "semi")
 
-    local bx, by, bs = pos.x + w - 32.0, pos.y + 7.0, 24.0
+    local bx, by, bs = pos.x + w - 34.0, pos.y + (h - 26.0) * 0.5, 26.0
     imgui.SetCursorScreenPos(V2(bx, by))
     local editClicked = imgui.InvisibleButton("edit_" .. id, V2(bs, bs))
     local editHovered = imgui.IsItemHovered()
     local editActive = imgui.IsItemActive()
 
-    local ebg = C.surface2
-    if editActive then ebg = C.accent elseif editHovered then ebg = {C.accent[1], C.accent[2], C.accent[3], 0.55} end
-    dl:AddRectFilled(V2(bx, by), V2(bx + bs, by + bs), Col(ebg), 7.0)
-
-    local dots = "..."
-    local dts = imgui.CalcTextSize(dots)
-    dl:AddText(V2(bx + (bs - dts.x) * 0.5, by + (bs - dts.y) * 0.5 - 1), Col(C.text), dots)
+    -- плавная подсветка кнопки редактирования + три точки
+    local es = GetAnim("edit_" .. id)
+    es.h = SmoothTo(es.h, editHovered and 1.0 or 0.0, 14.0)
+    es.a = SmoothTo(es.a, editActive and 1.0 or 0.0, 22.0)
+    local ebg = MixCol(C.surface2, C.accent, clamp01(es.h * 0.55 + es.a))
+    dl:AddRectFilled(V2(bx, by), V2(bx + bs, by + bs), Col(ebg), 8)
+    local dotCol = MixCol(C.muted, {1.0, 1.0, 1.0, 1.0}, clamp01(es.h + es.a))
+    for i = -1, 1 do
+        dl:AddCircleFilled(V2(bx + bs * 0.5 + i * 4.0, by + bs * 0.5), 1.5, Col(dotCol), 8)
+    end
 
     if editClicked then
         settingBuffers[id] = new.int(value or 0)
@@ -1259,22 +1478,17 @@ local function DrawOffline()
     imgui.Dummy(V2(0, THEME.gap))
     SectionTitle("ЗАПУСК ЭФИРА")
 
-    ModernButton("start_math", "МАТЕМАТИКА", half, 38, "success", function() autoStartEfir("math"); generateMath() end)
+    ModernButton("start_math", "МАТЕМАТИКА", half, 40, "success", function() autoStartEfir("math"); generateMath() end)
     imgui.SameLine(0, THEME.gap)
-    ModernButton("start_anagram", "АНАГРАММА", half, 38, "primary", function() autoStartEfir("anagram"); generateAnagram() end)
-    
+    ModernButton("start_anagram", "АНАГРАММА", half, 40, "primary", function() autoStartEfir("anagram"); generateAnagram() end)
+
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("start_vysh", "ВЫШИБАЛЫ", w, 38, "purple", function() autoStartEfir("vyshibaly"); generateVyshibaly() end)
+    ModernButton("start_vysh", "ВЫШИБАЛЫ", w, 40, "purple", function() autoStartEfir("vyshibaly"); generateVyshibaly() end)
 end
 
 local function DrawLeaderboard()
     local w = imgui.GetContentRegionAvail().x
     SectionTitle("РЕЙТИНГ ИГРОКОВ")
-    
-    local listHeight = 140.0
-    imgui.BeginChild("##sfn_leaderboard", V2(w, listHeight), false)
-    local cw = imgui.GetContentRegionAvail().x
-    local cdl = imgui.GetWindowDrawList()
 
     local list = {}
     for nick, info in pairs(scores) do
@@ -1285,32 +1499,66 @@ local function DrawLeaderboard()
         return tostring(a.nick) < tostring(b.nick)
     end)
 
-    local rowH = 28.0
-    if #list == 0 then
-        cdl:AddText(imgui.GetCursorScreenPos(), Col(C.muted), "Пока нет баллов")
+    local rowH = 30.0
+    local rowCount = math.min(8, #list)
+    local listHeight = (rowCount > 0) and (rowCount * rowH + 2.0) or 38.0
+    imgui.BeginChild("##sfn_leaderboard", V2(w, listHeight), false)
+    local cw = imgui.GetContentRegionAvail().x
+    local cdl = imgui.GetWindowDrawList()
+
+    if rowCount == 0 then
+        DText(cdl, imgui.GetCursorScreenPos() + V2(2, 9), Col(C.faint), "Пока нет баллов", "small")
     else
-        for i = 1, math.min(8, #list) do
+        local medals = { C.gold, C.silver, C.bronze }
+        for i = 1, rowCount do
             local item = list[i]
             local rpos = imgui.GetCursorScreenPos()
-            
-            local bg = C.surface
-            if i == 1 then bg = {0.240, 0.200, 0.080, 0.950}
-            elseif i == 2 then bg = {0.170, 0.180, 0.220, 0.950}
-            elseif i == 3 then bg = {0.220, 0.140, 0.100, 0.950} end
+            local rh = rowH - 6.0
 
-            cdl:AddRectFilled(rpos, rpos + V2(cw, rowH - 6), Col(bg), 7.0)
-            cdl:AddText(rpos + V2(8, 5), Col((i <= 3) and C.warning or C.muted), tostring(i) .. ".")
-            cdl:AddText(rpos + V2(30, 5), Col(C.text), formatNick(item.nick or "???"))
+            local bg = WithA(C.surface, 0.55)
+            if i == 1 then bg = {0.235, 0.188, 0.085, 0.920}
+            elseif i == 2 then bg = {0.152, 0.163, 0.198, 0.920}
+            elseif i == 3 then bg = {0.222, 0.148, 0.098, 0.920} end
+
+            cdl:AddRectFilled(rpos, rpos + V2(cw, rh), Col(bg), 8.0)
+            if i <= 3 then
+                cdl:AddRect(rpos, rpos + V2(cw, rh), Col(WithA(medals[i], 0.30)), 8.0, 0, 1.0)
+            end
+
+            -- мягкая подсветка строки под курсором
+            if HAS_HOVERRECT then
+                local rs = GetAnim("lbrow" .. i)
+                local hv = imgui.IsMouseHoveringRect(rpos, rpos + V2(cw, rh)) and 1.0 or 0.0
+                rs.h = SmoothTo(rs.h, hv, 12.0)
+                if rs.h > 0.02 then
+                    cdl:AddRectFilled(rpos, rpos + V2(cw, rh), Col(WithA({1.0, 1.0, 1.0, 1.0}, 0.045 * rs.h)), 8.0)
+                end
+            end
+
+            if i <= 3 then
+                -- медаль с номером
+                local mcx, mcy = rpos.x + 18.0, rpos.y + rh * 0.5
+                cdl:AddCircleFilled(V2(mcx, mcy), 8.6, Col(medals[i]), 20)
+                local ns = TextSize(tostring(i), "semi")
+                DText(cdl, V2(mcx - ns.x * 0.5, mcy - ns.y * 0.5 - 1), Col({0.10, 0.09, 0.05, 1.0}), tostring(i), "semi")
+            else
+                local its = TextSize(tostring(i) .. ".", "small")
+                DText(cdl, rpos + V2(10, (rh - its.y) * 0.5 - 1), Col(C.faint), tostring(i) .. ".", "small")
+            end
+
+            local nh = TextSize("Ы", "body").y
+            DText(cdl, rpos + V2(34, (rh - nh) * 0.5 - 1), Col(i <= 3 and C.text or WithA(C.text, 0.90)), formatNick(item.nick or "???"), "body")
 
             local scoreStr = tostring(item.score) .. " " .. pluralScore(item.score)
-            local ss = imgui.CalcTextSize(scoreStr)
-            cdl:AddText(rpos + V2(cw - ss.x - 8, 5), Col(C.success), scoreStr)
+            local ss = TextSize(scoreStr, "semi")
+            DText(cdl, rpos + V2(cw - ss.x - 10, (rh - ss.y) * 0.5 - 1), Col(i == 1 and C.gold or C.success), scoreStr, "semi")
+
             imgui.Dummy(V2(cw, rowH))
         end
     end
     imgui.EndChild()
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("clear_scores", "ОЧИСТИТЬ БАЗУ", w, 30, "ghost", function() imgui.OpenPopup("confirm_clear_scores") end)
+    ModernButton("clear_scores", "ОЧИСТИТЬ БАЗУ", w, 32, "ghost", function() imgui.OpenPopup("confirm_clear_scores") end)
 
     if imgui.BeginPopupModal("confirm_clear_scores", nil, imgui.WindowFlags.AlwaysAutoResize) then
         imgui.Text("Очистить базу баллов?")
@@ -1331,8 +1579,8 @@ local function DrawLive()
     local totalTime = efirStarted and (os.clock() - efirStartTime) or 0
 
     SectionTitle("СТАТИСТИКА")
-    StatTile("ВРЕМЯ", formatTime(totalTime), C.text, w, 60)
-    
+    StatTile("ВРЕМЯ", formatTime(totalTime), C.accent, w, 62)
+
     imgui.Dummy(V2(0, THEME.gap))
     SectionTitle("ТЕКУЩИЙ ВОПРОС")
     DrawQuestionCard()
@@ -1341,18 +1589,18 @@ local function DrawLive()
     imgui.Dummy(V2(0, THEME.gap))
 
     if currentFirstAnswer then
-        ModernButton("confirm_answer", "ВЕРНЫЙ ОТВЕТ", w, 36, "success", confirmCorrect)
+        ModernButton("confirm_answer", "ВЕРНЫЙ ОТВЕТ", w, 38, "success", confirmCorrect)
         imgui.Dummy(V2(0, THEME.gap))
     end
 
     SectionTitle("УПРАВЛЕНИЕ ЭФИРОМ")
-    ModernButton("new_question", "НОВЫЙ", half, 32, "primary", function()
+    ModernButton("new_question", "НОВЫЙ", half, 34, "primary", function()
         if currentMode == "math" then generateMath()
         elseif currentMode == "anagram" then generateAnagram()
         else generateVyshibaly() end
     end)
     imgui.SameLine(0, THEME.gap)
-    ModernButton("send_question", "В ЧАТ", half, 32, "neutral", function()
+    ModernButton("send_question", "В ЧАТ", half, 34, "neutral", function()
         if currentMode == "math" then sendChat("Следующий пример: " .. tostring(mathQuestion or "") .. tostring(mathQuestionSuffix or ""))
         elseif currentMode == "anagram" then sendChat("Новая Анаграмма: " .. formatAnagramDots(tostring(anagramShuffled or "")))
         else sendChat("Новое слово: " .. tostring(vyshibalyMasked or "")) end
@@ -1360,44 +1608,114 @@ local function DrawLive()
     end)
 
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("play_intro", "СТАРТОВАЯ РЕЧЬ", half, 32, "success", function() playIntro(currentType) end)
+    ModernButton("play_intro", "СТАРТОВАЯ РЕЧЬ", half, 34, "success", function() playIntro(currentType) end)
     imgui.SameLine(0, THEME.gap)
-    ModernButton("play_rules", "ПРАВИЛА", half, 32, "primary", playRules)
+    ModernButton("play_rules", "ПРАВИЛА", half, 34, "primary", playRules)
 
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("play_outro", "ЗАВЕРШАЮЩАЯ", half, 32, "purple", playOutro)
+    ModernButton("play_outro", "ЗАВЕРШАЮЩАЯ", half, 34, "purple", playOutro)
     imgui.SameLine(0, THEME.gap)
-    ModernButton("send_top", "ИТОГИ", half, 32, "neutral", sendTopScores)
+    ModernButton("send_top", "ИТОГИ", half, 34, "neutral", sendTopScores)
 
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("send_adv", "РЕКЛАМА", half, 32, "warning", sendAdvertisement)
-    imgui.SameLine(0, THEME.gap)
-    ModernButton("make_shot", "СКРИНШОТ", half, 32, "neutral", function() lua_thread.create(makeScreenshot) end)
+    -- Кнопка рекламы теперь на всю ширину, скриншот убран
+    ModernButton("send_adv", "РЕКЛАМА", w, 34, "warning", sendAdvertisement)
 
     imgui.Dummy(V2(0, THEME.gap))
-    ModernButton("stop_efir", "ЗАВЕРШИТЬ ЭФИР", w, 38, "danger", autoStopEfir)
+    ModernButton("stop_efir", "ЗАВЕРШИТЬ ЭФИР", w, 40, "danger", autoStopEfir)
 
     imgui.Dummy(V2(0, THEME.gap))
     DrawLeaderboard()
+end
+
+-- ------------------------------------------------------------
+-- ФОН ОКНА: градиент, свечения, сетка, бегущий блик, рамки
+-- ------------------------------------------------------------
+local function DrawWindowBackground(dl, wp, ws)
+    local w, hh = ws.x, ws.y
+    local r = THEME.radius
+
+    -- мягкая тень окна (два слоя)
+    dl:AddRectFilled(wp + V2(-1, 3), wp + ws + V2(1, 8), Col(WithA(C.shadow, 0.50)), r + 2)
+    dl:AddRectFilled(wp + V2(-3, 8), wp + ws + V2(3, 14), Col(WithA(C.shadow, 0.26)), r + 6)
+
+    -- базовый вертикальный градиент (полосы со скруглением углов)
+    if CF then
+        local strips = 6
+        for i = 1, strips do
+            local y0 = hh * (i - 1) / strips
+            local y1 = hh * i / strips + 0.6
+            local colr = MixCol(C.bgTop, C.bgBot, (i - 0.5) / strips)
+            local pmin = wp + V2(0, y0)
+            local pmax = wp + V2(w, y1)
+            if i == 1 then
+                dl:AddRectFilled(pmin, pmax, Col(colr), r, CF.TopLeft + CF.TopRight)
+            elseif i == strips then
+                dl:AddRectFilled(pmin, pmax, Col(colr), r, CF.BotLeft + CF.BotRight)
+            else
+                dl:AddRectFilled(pmin, pmax, Col(colr), 0.0)
+            end
+        end
+    else
+        dl:AddRectFilled(wp, wp + ws, Col(MixCol(C.bgTop, C.bgBot, 0.5)), r)
+    end
+
+    -- фоновые свечения по углам (вложенные скруглённые слои)
+    for i = 1, 5 do
+        local f = 1.0 - (i - 1) * 0.17
+        local inset = 16.0
+        local sx, sy = 210.0 * f, 150.0 * f
+        dl:AddRectFilled(wp + V2(inset, inset), wp + V2(inset + sx, inset + sy), Col(WithA({0.30, 0.55, 1.0, 1.0}, 0.020)), r - 2)
+        local bx, by = 230.0 * f, 165.0 * f
+        dl:AddRectFilled(wp + V2(w - inset - bx, hh - inset - by), wp + V2(w - inset, hh - inset), Col(WithA({0.55, 0.35, 0.98, 1.0}, 0.018)), r - 2)
+    end
+
+    -- верхняя акцентная линия + медленный бегущий блик
+    local lx0, lx1 = wp.x + r, wp.x + w - r
+    dl:AddRectFilled(V2(lx0, wp.y), V2(lx1, wp.y + 2), Col(WithA(C.accent, 0.55)), 0)
+    local span = lx1 - lx0
+    local sweepW = 90.0
+    local ph = (ui_time * 0.22) % 1.7
+    if ph < 1.0 and span > sweepW then
+        local cx0 = lx0 + ph * (span + sweepW) - sweepW * 0.5
+        local segA = { 0.08, 0.22, 0.22, 0.08 }
+        for seg = 1, 4 do
+            local sx0 = cx0 + (seg - 1) * (sweepW * 0.25)
+            local sx1 = sx0 + sweepW * 0.25
+            if sx0 < lx0 then sx0 = lx0 end
+            if sx1 > lx1 then sx1 = lx1 end
+            if sx1 > sx0 then
+                dl:AddRectFilled(V2(sx0, wp.y), V2(sx1, wp.y + 2), Col(WithA({0.85, 0.93, 1.0, 1.0}, segA[seg])), 0)
+            end
+        end
+    end
+
+    -- рамки: внутренняя светлая + внешняя
+    dl:AddRect(wp + V2(1, 1), wp + ws + V2(-1, -1), Col(C.inner), r - 1, 0, 1.0)
+    dl:AddRect(wp, wp + ws, Col(C.border), r, 0, 1.0)
 end
 
 local function ApplyTheme()
     imgui.SwitchContext()
     local style = imgui.GetStyle()
     style.WindowPadding = V2(THEME.padding, THEME.padding)
-    style.FramePadding = V2(8, 5)
+    style.FramePadding = V2(9, 6)
     style.ItemSpacing = V2(THEME.gap, 6)
     style.ItemInnerSpacing = V2(6, 4)
     style.WindowRounding = THEME.radius
-    style.FrameRounding = THEME.radius - 2
-    style.GrabRounding = THEME.radius
+    style.ChildRounding = 10.0
+    style.FrameRounding = THEME.radius - 4
+    style.GrabRounding = THEME.radius - 4
     style.ScrollbarRounding = THEME.radius
     style.PopupRounding = THEME.radius - 2
+    style.ScrollbarSize = 9.0
     style.WindowBorderSize = 0.0
     style.FrameBorderSize = 0.0
     style.ChildBorderSize = 0.0
     style.PopupBorderSize = 0.0
     style.WindowTitleAlign = V2(0.5, 0.5)
+    style.AntiAliasedLines = true
+    style.AntiAliasedFill = true
 
     local function SetCol(name, color, forcedAlpha)
         local id = imgui.Col[name]
@@ -1407,22 +1725,24 @@ local function ApplyTheme()
         end
     end
 
+    local popupBg = MixCol(C.bgTop, C.bgBot, 0.5)
+
     SetCol("WindowBg", {0, 0, 0}, 0.0)
     SetCol("ChildBg", {0, 0, 0}, 0.0)
-    SetCol("PopupBg", C.bg, 0.98)
+    SetCol("PopupBg", popupBg, 0.985)
     SetCol("Border", C.border)
     SetCol("Text", C.text)
-    SetCol("TextDisabled", C.muted)
+    SetCol("TextDisabled", C.faint)
     SetCol("Button", C.surface2)
-    SetCol("ButtonHovered", C.accent)
-    SetCol("ButtonActive", {0.180, 0.520, 0.900, 1.000})
+    SetCol("ButtonHovered", {0.360, 0.660, 1.000, 1.000})
+    SetCol("ButtonActive", {0.190, 0.520, 0.900, 1.000})
     SetCol("FrameBg", C.surface)
     SetCol("FrameBgHovered", C.surface2)
-    SetCol("FrameBgActive", C.accent)
+    SetCol("FrameBgActive", {0.240, 0.540, 0.940, 1.000})
     SetCol("CheckMark", C.accent)
     SetCol("SliderGrab", C.accent)
     SetCol("SliderGrabActive", C.success)
-    SetCol("ScrollbarBg", {0.080, 0.090, 0.110, 0.550})
+    SetCol("ScrollbarBg", {0.070, 0.080, 0.100, 0.450})
     SetCol("ScrollbarGrab", C.surface2)
     SetCol("ScrollbarGrabHovered", C.accent)
     SetCol("ScrollbarGrabActive", C.accent)
@@ -1433,16 +1753,32 @@ imgui.OnInitialize(function()
     pcall(function()
         local io = imgui.GetIO()
         local ranges = io.Fonts:GetGlyphRangesCyrillic()
-        for _, p in ipairs({
+        local REGULAR = {
             "C:\\Windows\\Fonts\\segoeui.ttf",
             "C:\\Windows\\Fonts\\tahoma.ttf",
             "C:\\Windows\\Fonts\\arial.ttf",
-        }) do
-            if doesFileExist(p) then
-                io.Fonts:AddFontFromFileTTF(p, 15.0, nil, ranges)
-                break
+        }
+        local SEMIBOLD = {
+            "C:\\Windows\\Fonts\\seguisb.ttf",
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+            "C:\\Windows\\Fonts\\tahomabd.ttf",
+            "C:\\Windows\\Fonts\\arialbd.ttf",
+        }
+        local function AddFont(cands, size)
+            for _, p in ipairs(cands) do
+                if doesFileExist(p) then
+                    local ok, f = pcall(io.Fonts.AddFontFromFileTTF, io.Fonts, p, size, nil, ranges)
+                    if ok and f ~= nil then return f end
+                end
             end
+            return nil
         end
+        -- body добавляется первым и становится шрифтом по умолчанию
+        FONTS.body  = AddFont(REGULAR, 16.0)
+        FONTS.small = AddFont(REGULAR, 13.0)
+        FONTS.semi  = AddFont(SEMIBOLD, 16.0) or FONTS.body
+        FONTS.big   = AddFont(SEMIBOLD, 19.0) or FONTS.semi
+        FONTS.title = AddFont(SEMIBOLD, 22.0) or FONTS.semi
     end)
 end)
 
@@ -1451,17 +1787,37 @@ imgui.OnFrame(
     function()
         local now = os.clock()
         local dt = now - last_time
-        if dt > 0.15 then dt = 0.15 end
+        if dt > 0.15 then dt = 0.15 elseif dt < 0.0 then dt = 0.0 end
         last_time = now
+        frame_dt = dt
+        ui_time = ui_time + dt
 
         local target = (WinState[0] and ACCESS_GRANTED) and 1.0 or 0.0
         anim_alpha = anim_alpha + (target - anim_alpha) * math.min(1.0, 14.0 * dt)
 
-        if anim_alpha < 0.005 and target < 0.01 then anim_alpha = 0.0; return end
+        -- анимация модального окна пола (живёт только пока видимо основное окно)
+        local mainVisible = (WinState[0] or anim_alpha > 0.005)
+        local gTarget = (genderWindowOpen[0] and pendingGenderConfirm ~= nil and mainVisible) and 1.0 or 0.0
+        gender_anim = gender_anim + (gTarget - gender_anim) * math.min(1.0, 13.0 * dt)
+        if gender_anim < 0.004 and gTarget < 0.01 then gender_anim = 0.0 end
+        if genderWindowOpen[0] and pendingGenderConfirm then
+            genderSnap = { nick = pendingGenderConfirm.nick, id = pendingGenderConfirm.id }
+        end
+
+        if anim_alpha < 0.005 and target < 0.01 then
+            anim_alpha = 0.0
+            gender_anim = 0.0
+            return
+        end
 
         local display = imgui.GetIO().DisplaySize
+        local eased = clamp01(anim_alpha)
+        eased = eased * eased * (3.0 - 2.0 * eased)
+
+        ctx_alpha = anim_alpha
         imgui.SetNextWindowSize(V2(THEME.width, 0), imgui.Cond.Always)
-        imgui.SetNextWindowPos(V2(display.x * 0.5, display.y * 0.5), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
+        -- Cond.FirstUseEver позволяет двигать окно. math.floor убирает пикселизацию текста.
+        imgui.SetNextWindowPos(V2(math.floor(display.x * 0.5), math.floor(display.y * 0.5 + (1.0 - eased) * 16.0)), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
         imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, anim_alpha)
 
         local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoBringToFrontOnFocus + imgui.WindowFlags.AlwaysAutoResize
@@ -1471,9 +1827,7 @@ imgui.OnFrame(
             local dl = imgui.GetWindowDrawList()
             local wp = imgui.GetWindowPos()
             local ws = imgui.GetWindowSize()
-            dl:AddRectFilled(wp, wp + ws, Col(C.bg), THEME.radius)
-            dl:AddRect(wp, wp + ws, Col(C.border), THEME.radius, 0, 1.0)
-            dl:AddRectFilled(wp + V2(THEME.radius, 0), wp + V2(ws.x - THEME.radius, 2), Col(C.accent), 0.0)
+            DrawWindowBackground(dl, wp, ws)
 
             imgui.SetCursorPos(V2(THEME.padding, THEME.padding))
             DrawHeader(function() WinState[0] = false end)
@@ -1485,11 +1839,14 @@ imgui.OnFrame(
         imgui.End()
         imgui.PopStyleVar()
 
-        if genderWindowOpen[0] and pendingGenderConfirm then
-            local gW, gH = 330.0, 190.0
+        -- модальное окно подтверждения пола (с плавным появлением/исчезновением)
+        if gender_anim > 0.008 and genderSnap then
+            ctx_alpha = anim_alpha * gender_anim
+            local nick = (pendingGenderConfirm and pendingGenderConfirm.nick) or genderSnap.nick
+            local gW, gH = 336.0, 198.0
             imgui.SetNextWindowSize(V2(gW, gH), imgui.Cond.Always)
-            imgui.SetNextWindowPos(V2(display.x * 0.5, display.y * 0.5), imgui.Cond.Always, V2(0.5, 0.5))
-            imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, 1.0)
+            imgui.SetNextWindowPos(V2(display.x * 0.5, display.y * 0.5 + (1.0 - gender_anim) * 12.0), imgui.Cond.Always, V2(0.5, 0.5))
+            imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, clamp01(ctx_alpha))
             local gFlags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoBringToFrontOnFocus
             local gOpen = imgui.Begin("##sfn_gender_modal", nil, gFlags)
 
@@ -1497,21 +1854,31 @@ imgui.OnFrame(
                 local gdl = imgui.GetWindowDrawList()
                 local gp = imgui.GetWindowPos()
                 local gs = imgui.GetWindowSize()
-                gdl:AddRectFilled(gp, gp + gs, Col(C.bg), THEME.radius)
-                gdl:AddRect(gp, gp + gs, Col(C.border), THEME.radius, 0, 1.0)
+                local gr = THEME.radius
 
-                imgui.SetCursorPos(V2(THEME.padding, THEME.padding))
+                gdl:AddRectFilled(gp + V2(0, 4), gp + gs + V2(0, 10), Col(WithA(C.shadow, 0.45)), gr + 2)
+                gdl:AddRectFilled(gp, gp + gs, Col(MixCol(C.bgTop, C.bgBot, 0.5)), gr)
+                for i = 1, 3 do
+                    local f = 1.0 - (i - 1) * 0.25
+                    gdl:AddRectFilled(gp + V2(14, 14), gp + V2(14 + 180 * f, 14 + 110 * f), Col(WithA({0.30, 0.55, 1.0, 1.0}, 0.022)), gr - 2)
+                end
+                gdl:AddRectFilled(V2(gp.x + gr, gp.y), V2(gp.x + gs.x - gr, gp.y + 2), Col(WithA(C.accent, 0.55)), 0)
+                gdl:AddRect(gp, gp + gs, Col(C.border), gr, 0, 1.0)
+
+                imgui.SetCursorPos(V2(THEME.padding + 2, THEME.padding + 2))
                 local pos = imgui.GetCursorScreenPos()
                 local w = imgui.GetContentRegionAvail().x
 
-                gdl:AddText(pos, Col(C.text), "Подтверждение пола")
-                gdl:AddText(pos + V2(0, 20), Col(C.muted), "Игрок: " .. formatNick(pendingGenderConfirm.nick or "???"))
-                gdl:AddLine(pos + V2(0, 46), pos + V2(w, 46), Col(C.border), 1.0)
+                DText(gdl, pos + V2(0, 2), Col(C.text), "Подтверждение пола", "semi", 0.30)
+                DText(gdl, pos + V2(1, 26), Col(C.muted), "Игрок: " .. formatNick(nick or "???"), "small")
+                gdl:AddRectFilled(pos + V2(0, 48), pos + V2(w * 0.4, 49), Col(WithA(C.accent, 0.60)), 0)
+                gdl:AddRectFilled(pos + V2(w * 0.4, 48), pos + V2(w, 49), Col(WithA(C.border, 0.50)), 0)
 
                 local half = (w - THEME.gap) * 0.5
-                imgui.SetCursorScreenPos(pos + V2(0, 58))
+                imgui.SetCursorScreenPos(pos + V2(0, 60))
 
                 ModernButton("gender_male", "ПАРЕНЬ", half, 38, "primary", function()
+                    if not pendingGenderConfirm then genderWindowOpen[0] = false return end
                     genders[pendingGenderConfirm.nick] = "m"
                     saveGenders()
                     applyCorrectAnswer(pendingGenderConfirm.nick, pendingGenderConfirm.id)
@@ -1519,15 +1886,15 @@ imgui.OnFrame(
                 end)
                 imgui.SameLine(0, THEME.gap)
                 ModernButton("gender_female", "ДЕВУШКА", half, 38, "purple", function()
+                    if not pendingGenderConfirm then genderWindowOpen[0] = false return end
                     genders[pendingGenderConfirm.nick] = "f"
                     saveGenders()
                     applyCorrectAnswer(pendingGenderConfirm.nick, pendingGenderConfirm.id)
                     genderWindowOpen[0] = false
                 end)
 
-                imgui.SetCursorScreenPos(pos + V2(0, 112))
-                gdl:AddText(pos + V2(0, 112), Col(C.muted), "Пол сохранится в базу.")
-                imgui.SetCursorScreenPos(pos + V2(0, 138))
+                DText(gdl, pos + V2(0, 108), Col(C.faint), "Пол сохранится в базу.", "small")
+                imgui.SetCursorScreenPos(pos + V2(0, 130))
 
                 ModernButton("gender_cancel", "ОТМЕНА", w, 30, "ghost", function()
                     pendingGenderConfirm = nil
@@ -1536,6 +1903,7 @@ imgui.OnFrame(
             end
             imgui.End()
             imgui.PopStyleVar()
+            ctx_alpha = anim_alpha
         end
     end
 )
